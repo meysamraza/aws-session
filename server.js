@@ -1,464 +1,175 @@
+// Minimal Express server for CI/CD demo
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const cookieParser = require('cookie-parser');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const multer = require('multer');
-require('dotenv').config();
+const app = express();
+const port = process.env.PORT || 3000;
 
-const db = require('./db');
+// Hardcoded list of products for the demo store
+const products = [
+  { id: 1, name: 'Wireless Headphones', price: '$99.99' },
+  { id: 2, name: 'Smart Watch', price: '$149.99' },
+  { id: 3, name: 'Leather Wallet', price: '$39.99' },
+  { id: 4, name: 'Running Shoes', price: '$79.99' },
+  { id: 5, name: 'Minimalist Backpack', price: '$59.99' },
+  { id: 6, name: 'Ceramic Coffee Mug', price: '$14.99' }
+];
 
-const app = express(); // nosemgrep: javascript.express.security.audit.express-check-csurf-middleware-usage.express-check-csurf-middleware-usage
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'devops_jwt_secret_key_change_me';
+// Serve the single HTML page
+app.get('/', (req, res) => {
+  const productCardsHtml = products
+    .map(
+      (product) => `
+        <div class="card">
+          <div class="image-placeholder">
+            <span>Image</span>
+          </div>
+          <div class="card-content">
+            <h3 class="product-name">${product.name}</h3>
+            <p class="product-price">${product.price}</p>
+            <button type="button" class="cart-button">Add to cart</button>
+          </div>
+        </div>
+      `
+    )
+    .join('');
 
-// Setup file upload destination (S3)
-const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
-const multerS3 = require('multer-s3');
-
-const s3 = new S3Client({ region: 'ap-south-1' });
-const BUCKET = 'ecom-uploads-mumbai-611182198012';
-
-const upload = multer({
-  storage: multerS3({
-    s3,
-    bucket: BUCKET,
-    contentType: multerS3.AUTO_CONTENT_TYPE,
-    key: (req, file, cb) => {
-      const ext = path.extname(file.originalname);
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-      cb(null, 'product-' + uniqueSuffix + ext);
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CI/CD Demo</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
     }
-  })
-});
-
-// View engine & static files
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(cookieParser());
-
-// Serve uploaded images from S3 (local public/uploads files still win first)
-app.get('/uploads/:key', async (req, res) => {
-  try {
-    const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: req.params.key }));
-    res.set('Content-Type', out.ContentType);
-    out.Body.pipe(res);
-  } catch (e) {
-    res.status(404).end();
-  }
-});
-
-// Cart cookie helpers
-function getCart(req) {
-  try {
-    return req.cookies.cart ? JSON.parse(req.cookies.cart) : [];
-  } catch (err) {
-    return [];
-  }
-}
-
-function saveCart(res, cart) {
-  res.cookie('cart', JSON.stringify(cart), { httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 });
-}
-
-// Global Auth & Context Middleware
-app.use((req, res, next) => {
-  const token = req.cookies.token;
-  if (token) {
-    try {
-      req.user = jwt.verify(token, JWT_SECRET);
-    } catch (e) {
-      res.clearCookie('token');
-      req.user = null;
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background-color: #f7f9fa;
+      color: #333;
+      padding: 24px 16px;
     }
-  } else {
-    req.user = null;
-  }
-
-  const cart = getCart(req);
-  res.locals.currentUser = req.user;
-  res.locals.cartCount = cart.reduce((sum, item) => sum + (item.quantity || 1), 0);
-  res.locals.alertMessage = req.query.msg || null;
-  res.locals.errorMessage = req.query.error || null;
-  next();
-});
-
-// Route Guard Middlewares
-function requireAuth(req, res, next) {
-  if (!req.user) {
-    return res.redirect(`/login?redirect=${encodeURIComponent(req.originalUrl)}&error=Please log in first`);
-  }
-  next();
-}
-
-function requireAdmin(req, res, next) {
-  if (!req.user) {
-    return res.redirect(`/login?redirect=${encodeURIComponent(req.originalUrl)}&error=Please log in first`);
-  }
-  if (req.user.role !== 'admin') {
-    return res.status(403).render('404', { title: 'Access Denied', message: 'Forbidden: Admin privileges required.' });
-  }
-  next();
-}
-
-// -----------------------------------------------------------------------------
-// HEALTH CHECK
-// -----------------------------------------------------------------------------
-app.get('/health', async (req, res) => {
-  try {
-    await db.query('SELECT 1');
-    res.status(200).json({
-      status: 'ok',
-      database: 'connected',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime()
-    });
-  } catch (err) {
-    res.status(200).json({
-      status: 'ok',
-      database: 'disconnected',
-      error: err.message,
-      uptime: process.uptime()
-    });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// HOME PAGE (Product Catalog & Search)
-// -----------------------------------------------------------------------------
-app.get('/', async (req, res) => {
-  const searchQuery = req.query.q ? req.query.q.trim() : '';
-  try {
-    let result;
-    if (searchQuery) {
-      result = await db.query(
-        'SELECT * FROM products WHERE name ILIKE $1 OR description ILIKE $1 ORDER BY id ASC',
-        [`%${searchQuery}%`]
-      );
-    } else {
-      result = await db.query('SELECT * FROM products ORDER BY id ASC');
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
     }
-    res.render('index', { products: result.rows, searchQuery, title: 'Shop hehe' });
-  } catch (err) {
-    console.error('Error fetching products:', err.message);
-    res.render('index', { products: [], searchQuery, title: 'Shop Gear', errorMessage: 'Could not load products. Please ensure the database is initialized.' });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// PRODUCT DETAIL
-// -----------------------------------------------------------------------------
-app.get('/products/:id', async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  if (isNaN(id)) {
-    return res.status(404).render('404', { title: 'Product Not Found', message: 'Invalid product ID.' });
-  }
-
-  try {
-    const { rows } = await db.query('SELECT * FROM products WHERE id = $1', [id]);
-    if (rows.length === 0) {
-      return res.status(404).render('404', { title: 'Product Not Found', message: 'Product not found.' });
+    .demo-header {
+      background: #ffffff;
+      padding: 24px;
+      border-radius: 8px;
+      margin-bottom: 24px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
     }
-    res.render('product', { product: rows[0], title: rows[0].name });
-  } catch (err) {
-    console.error('Error fetching product:', err.message);
-    res.status(500).render('404', { title: 'Server Error', message: 'Error fetching product details.' });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// CART & CHECKOUT
-// -----------------------------------------------------------------------------
-app.get('/cart', async (req, res) => {
-  const cart = getCart(req);
-  if (cart.length === 0) {
-    return res.render('cart', { items: [], totalAmount: 0, title: 'Shopping Cart' });
-  }
-
-  try {
-    const productIds = cart.map(i => parseInt(i.productId, 10)).filter(Boolean);
-    const { rows: products } = await db.query(
-      'SELECT * FROM products WHERE id = ANY($1::int[])',
-      [productIds]
-    );
-
-    let totalAmount = 0;
-    const items = cart.map(cartItem => {
-      const product = products.find(p => p.id === parseInt(cartItem.productId, 10));
-      if (!product) return null;
-      const subtotal = Number(product.price) * cartItem.quantity;
-      totalAmount += subtotal;
-      return { product, quantity: cartItem.quantity, subtotal };
-    }).filter(Boolean);
-
-    res.render('cart', { items, totalAmount, title: 'Shopping Cart' });
-  } catch (err) {
-    console.error('Cart fetch error:', err.message);
-    res.render('cart', { items: [], totalAmount: 0, title: 'Shopping Cart', errorMessage: 'Failed to load cart items.' });
-  }
-});
-
-app.post('/cart/add', (req, res) => {
-  const productId = parseInt(req.body.productId, 10);
-  const quantity = Math.max(1, parseInt(req.body.quantity || 1, 10));
-
-  let cart = getCart(req);
-  const existing = cart.find(item => item.productId === productId);
-  if (existing) {
-    existing.quantity += quantity;
-  } else {
-    cart.push({ productId, quantity });
-  }
-
-  saveCart(res, cart);
-  res.redirect('/cart?msg=Item added to cart!');
-});
-
-app.post('/cart/remove', (req, res) => {
-  const productId = parseInt(req.body.productId, 10);
-  let cart = getCart(req);
-  cart = cart.filter(item => item.productId !== productId);
-  saveCart(res, cart);
-  res.redirect('/cart?msg=Item removed from cart.');
-});
-
-app.post('/cart/update', (req, res) => {
-  const productId = parseInt(req.body.productId, 10);
-  const quantity = parseInt(req.body.quantity, 10);
-  let cart = getCart(req);
-  if (isNaN(quantity) || quantity <= 0) {
-    cart = cart.filter(item => item.productId !== productId);
-  } else {
-    const item = cart.find(i => i.productId === productId);
-    if (item) {
-      item.quantity = quantity;
+    .demo-header h1 {
+      font-size: 28px;
+      margin-bottom: 8px;
+      color: #111827;
     }
-  }
-  saveCart(res, cart);
-  res.redirect('/cart?msg=Cart updated.');
-});
-
-app.post('/cart/clear', (req, res) => {
-  res.clearCookie('cart');
-  res.redirect('/cart?msg=Cart cleared.');
-});
-
-app.post('/checkout', requireAuth, async (req, res) => {
-  const cart = getCart(req);
-  if (cart.length === 0) {
-    return res.redirect('/cart?error=Cart is empty');
-  }
-
-  try {
-    const productIds = cart.map(i => parseInt(i.productId, 10)).filter(Boolean);
-    const { rows: products } = await db.query(
-      'SELECT * FROM products WHERE id = ANY($1::int[])',
-      [productIds]
-    );
-
-    let totalAmount = 0;
-    const orderItems = [];
-    for (const item of cart) {
-      const prod = products.find(p => p.id === parseInt(item.productId, 10));
-      if (prod) {
-        totalAmount += Number(prod.price) * item.quantity;
-        orderItems.push({
-          productId: prod.id,
-          name: prod.name,
-          price: prod.price,
-          quantity: item.quantity
-        });
-      }
+    .demo-header p {
+      font-size: 16px;
+      color: #4b5563;
     }
-
-    // Insert into orders table
-    const { rows: orderRows } = await db.query(
-      'INSERT INTO orders (user_id, total_amount, status, payment_method) VALUES ($1, $2, $3, $4) RETURNING id',
-      [req.user.id, totalAmount, 'Paid', 'Credit Card (Simulated)']
-    );
-    const orderId = orderRows[0].id;
-
-    // Insert order items
-    for (const oi of orderItems) {
-      await db.query(
-        'INSERT INTO order_items (order_id, product_id, product_name, price, quantity) VALUES ($1, $2, $3, $4, $5)',
-        [orderId, oi.productId, oi.name, oi.price, oi.quantity]
-      );
+    .store-header {
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid #e5e7eb;
     }
-
-    res.clearCookie('cart');
-    res.redirect(`/orders?msg=Order #${orderId} completed successfully!`);
-  } catch (err) {
-    console.error('Checkout processing error:', err.message);
-    res.redirect('/cart?error=Payment failed. Please try again.');
-  }
-});
-
-// -----------------------------------------------------------------------------
-// ORDERS HISTORY
-// -----------------------------------------------------------------------------
-app.get('/orders', requireAuth, async (req, res) => {
-  try {
-    const { rows: orders } = await db.query(
-      'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user.id]
-    );
-
-    for (const order of orders) {
-      const { rows: items } = await db.query(
-        'SELECT * FROM order_items WHERE order_id = $1',
-        [order.id]
-      );
-      order.items = items;
+    .store-header h2 {
+      font-size: 22px;
+      color: #1f2937;
     }
-
-    res.render('orders', { orders, title: 'Order History' });
-  } catch (err) {
-    console.error('Orders fetch error:', err.message);
-    res.render('orders', { orders: [], title: 'Order History', errorMessage: 'Could not load your orders.' });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// AUTHENTICATION (Register, Login, Logout)
-// -----------------------------------------------------------------------------
-app.get('/login', (req, res) => {
-  if (req.user) return res.redirect('/');
-  res.render('login', { title: 'Login', redirect: req.query.redirect || '' });
-});
-
-app.post('/login', async (req, res) => {
-  const { email, password, redirect } = req.body;
-  try {
-    const { rows } = await db.query('SELECT * FROM users WHERE email = $1', [email ? email.trim() : '']);
-    if (rows.length === 0) {
-      return res.status(401).render('login', { title: 'Login', redirect, errorMessage: 'Invalid email or password.' });
+    .product-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 20px;
     }
-
-    const user = rows[0];
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).render('login', { title: 'Login', redirect, errorMessage: 'Invalid email or password.' });
+    .card {
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
-
-    const token = jwt.sign(
-      { id: user.id, name: user.name, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.cookie('token', token, { httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 });
-    res.redirect(redirect || '/?msg=Logged in successfully!');
-  } catch (err) {
-    console.error('Login error:', err.message);
-    res.render('login', { title: 'Login', redirect, errorMessage: 'An error occurred during login.' });
-  }
-});
-
-app.get('/register', (req, res) => {
-  if (req.user) return res.redirect('/');
-  res.render('register', { title: 'Register' });
-});
-
-app.post('/register', async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) {
-    return res.render('register', { title: 'Register', errorMessage: 'All fields are required.' });
-  }
-
-  try {
-    const existing = await db.query('SELECT id FROM users WHERE email = $1', [email.trim()]);
-    if (existing.rows.length > 0) {
-      return res.render('register', { title: 'Register', errorMessage: 'Email is already registered.' });
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
     }
+    .image-placeholder {
+      height: 180px;
+      background-color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #64748b;
+      font-size: 16px;
+      font-weight: 500;
+    }
+    .card-content {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      flex-grow: 1;
+    }
+    .product-name {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #111827;
+    }
+    .product-price {
+      font-size: 16px;
+      font-weight: 700;
+      color: #059669;
+      margin-bottom: 16px;
+    }
+    .cart-button {
+      margin-top: auto;
+      background-color: #2563eb;
+      color: #ffffff;
+      border: none;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 0.2s ease;
+    }
+    .cart-button:hover {
+      background-color: #1d4ed8;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="demo-header">
+      <h1>CI/CD Demo</h1>
+      <p>Application deployed successfully.</p>
+    </div>
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const { rows } = await db.query(
-      'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email, role',
-      [name.trim(), email.trim(), hashedPassword, 'user']
-    );
+    <header class="store-header">
+      <h2>Demo Store</h2>
+    </header>
 
-    const newUser = rows[0];
-    const token = jwt.sign(
-      { id: newUser.id, name: newUser.name, email: newUser.email, role: newUser.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    <div class="product-grid">
+      ${productCardsHtml}
+    </div>
+  </div>
+</body>
+</html>`;
 
-    res.cookie('token', token, { httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 });
-    res.redirect('/?msg=Account created successfully!');
-  } catch (err) {
-    console.error('Register error:', err.message);
-    res.render('register', { title: 'Register', errorMessage: 'Could not create account: ' + err.message });
-  }
+  res.send(html);
 });
 
-app.get('/logout', (req, res) => {
-  res.clearCookie('token');
-  res.redirect('/login?msg=Logged out successfully.');
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
-// -----------------------------------------------------------------------------
-// ADMIN (Manage & Upload Products)
-// -----------------------------------------------------------------------------
-app.get('/admin', requireAdmin, async (req, res) => {
-  try {
-    const { rows: products } = await db.query('SELECT * FROM products ORDER BY id DESC');
-    res.render('admin', { products, title: 'Admin Dashboard' });
-  } catch (err) {
-    console.error('Admin page error:', err.message);
-    res.render('admin', { products: [], title: 'Admin Dashboard', errorMessage: 'Failed to load products.' });
-  }
-});
-
-app.post('/admin/products', requireAdmin, upload.single('image'), async (req, res) => {
-  const { name, description, price } = req.body;
-  if (!name || !price || !req.file) {
-    return res.redirect('/admin?error=Name, price, and image are required.');
-  }
-
-  try {
-    const imageName = req.file.key;
-    await db.query(
-      'INSERT INTO products (name, description, price, image) VALUES ($1, $2, $3, $4)',
-      [name.trim(), description ? description.trim() : '', parseFloat(price), imageName]
-    );
-    res.redirect('/admin?msg=Product added successfully!');
-  } catch (err) {
-    console.error('Admin add product error:', err.message);
-    res.redirect('/admin?error=Failed to add product: ' + err.message);
-  }
-});
-
-app.post('/admin/products/:id/delete', requireAdmin, async (req, res) => {
-  try {
-    await db.query('DELETE FROM products WHERE id = $1', [req.params.id]);
-    res.redirect('/admin?msg=Product deleted successfully.');
-  } catch (err) {
-    console.error('Admin delete product error:', err.message);
-    res.redirect('/admin?error=Failed to delete product.');
-  }
-});
-
-// 404 Catch-all Handler
-app.use((req, res) => {
-  res.status(404).render('404', { title: 'Page Not Found', message: 'The page you requested does not exist.' });
-});
-
-// Process Error Safety Guards (prevents crashing on db connectivity drops)
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
-});
-
-// Start Server listening on 0.0.0.0
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-  console.log(`Health check available at http://localhost:${PORT}/health`);
+// Start the server
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
 });
