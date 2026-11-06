@@ -1,0 +1,17 @@
+sudo dnf install -y nodejs git
+
+git clone https://github.com/meysamraza/aws-session.git
+
+cd aws-session
+
+npm install
+
+pkill -f "node server.js"
+
+nohup node server.js > app.log 2>&1 &
+
+sleep 3
+
+curl http://localhost:3000/health
+
+cat app.log
