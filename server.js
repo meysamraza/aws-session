@@ -3,7 +3,7 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Hardcoded list of products for the demo store
+// Hardcoded list of products for the demo store hehe he
 const products = [
   { id: 1, name: 'Wireless Headphones', price: '$99.99' },
   { id: 2, name: 'Smart Watch', price: '$149.99' },
@@ -13,7 +13,7 @@ const products = [
   { id: 6, name: 'Ceramic Coffee Mug', price: '$14.99' }
 ];
 
-// Serve the single HTML page
+// Serve the single HTML page hi
 app.get('/', (req, res) => {
   const productCardsHtml = products
     .map(
